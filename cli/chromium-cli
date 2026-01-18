@@ -1,0 +1,1299 @@
+#!/bin/bash
+# chromium-cli - Control Chromium-based browsers via CLI
+# Usage: chromium-cli [command] [options]
+
+set -e
+
+# Configuration
+DEFAULT_PORT=8765
+PORT_RANGE_START=8765
+PORT_RANGE_END=8769
+SERVER_HOST="127.0.0.1"
+CONFIG_FILE="$HOME/.chromium-cli.conf"
+
+# Load config if exists
+if [[ -f "$CONFIG_FILE" ]]; then
+  source "$CONFIG_FILE"
+fi
+
+# Colors (disabled by default per user preference)
+RED=""
+GREEN=""
+YELLOW=""
+BLUE=""
+NC=""
+
+# Server base URL
+BASE_URL="http://${SERVER_HOST}:${CHROMIUM_CLI_PORT:-$DEFAULT_PORT}"
+
+# ============================================================================
+# Helper functions
+# ============================================================================
+
+error() {
+  echo "Error: $1" >&2
+  exit 1
+}
+
+# Normalize and validate URL
+normalize_url() {
+  local url="$1"
+
+  # Empty check
+  [[ -z "$url" ]] && return 1
+
+  # Add https if no protocol
+  if [[ ! "$url" =~ ^https?:// ]]; then
+    url="https://$url"
+  fi
+
+  # Basic validation - must have a dot (domain) or be localhost
+  local host
+  host=$(echo "$url" | sed -E 's|^https?://([^/:]+).*|\1|')
+
+  if [[ ! "$host" =~ \. && "$host" != "localhost" ]]; then
+    return 1
+  fi
+
+  echo "$url"
+  return 0
+}
+
+# Make HTTP request
+request() {
+  local method="$1"
+  local endpoint="$2"
+  shift 2
+  local data="$*"
+
+  local url="${BASE_URL}${endpoint}"
+  local response
+  local timeout_seconds=$((${REQUEST_TIMEOUT:-30000} / 1000))
+
+  if [[ "$method" == "GET" ]]; then
+    response=$(curl -s -m "$timeout_seconds" -X GET "$url" 2>/dev/null) || error "Cannot connect to server at $BASE_URL (timeout: ${timeout_seconds}s)"
+  else
+    response=$(curl -s -m "$timeout_seconds" -X POST -H "Content-Type: application/json" -d "$data" "$url" 2>/dev/null) || error "Cannot connect to server at $BASE_URL (timeout: ${timeout_seconds}s)"
+  fi
+
+  # Check for error
+  local success
+  success=$(echo "$response" | jq -r '.success // false' 2>/dev/null)
+
+  if [[ "$success" != "true" ]]; then
+    local err
+    err=$(echo "$response" | jq -r '.error // "Unknown error"' 2>/dev/null)
+    error "$err"
+  fi
+
+  echo "$response" | jq -r '.data'
+}
+
+# Format tab list
+format_tabs() {
+  jq -r '.[] | "\(.id)\t\(.active | if . then "*" else " " end)\t\(.title[:50])\t\(.url[:60])"'
+}
+
+# Format windows list
+format_windows() {
+  jq -r '.[] | "\(.id)\t\(.state)\t\(.tabCount // "?")\ttabs"'
+}
+
+# Auto-discover server on port range
+discover_server() {
+  for port in $(seq $PORT_RANGE_START $PORT_RANGE_END); do
+    if curl -s --connect-timeout 1 "http://${SERVER_HOST}:${port}/status" >/dev/null 2>&1; then
+      echo "$port"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ============================================================================
+# Commands
+# ============================================================================
+
+cmd_help() {
+  cat << 'EOF'
+chromium-cli - Control Chromium-based browsers via CLI
+
+USAGE:
+  chromium-cli [command] [subcommand] [options]
+
+SERVER COMMANDS:
+  server start              Start the bridge server
+  server stop               Stop the bridge server
+  server status             Check server status
+  discover                  Find running servers on ports 8765-8769
+
+TAB COMMANDS:
+  tabs list                 List all tabs
+  tabs get <id>             Get tab details
+  tabs create [url]         Create new tab
+  tabs close <id>           Close tab(s) (comma-separated)
+  tabs reload [id]          Reload tab (active if no id)
+  tabs navigate <url> [id]  Navigate tab to URL
+  tabs activate <id>        Activate/focus tab
+  tabs find <pattern>       Find tabs by URL/title pattern
+  tabs back [id]            Go back
+  tabs forward [id]         Go forward
+  tabs pin <id>             Pin tab
+  tabs unpin <id>           Unpin tab
+  tabs mute <id>            Mute tab
+  tabs unmute <id>          Unmute tab
+  tabs duplicate <id>       Duplicate tab
+  tabs move <id> <index>    Move tab to index
+
+TAB GROUPS:
+  groups list               List tab groups
+  groups create <ids>       Group tabs (comma-separated ids)
+  groups update <id>        Update group (--title, --color)
+  tabs ungroup <ids>        Ungroup tabs
+
+WINDOW COMMANDS:
+  windows list              List all windows
+  windows get <id>          Get window details
+  windows create [url]      Create new window
+  windows close <id>        Close window
+  windows focus <id>        Focus window
+  windows minimize <id>     Minimize window
+  windows maximize <id>     Maximize window
+  windows fullscreen <id>   Fullscreen window
+
+DOM COMMANDS:
+  dom query <selector>      Query elements
+  dom text <selector>       Get element text
+  dom html <selector>       Get element HTML
+  dom attr <selector> <attr>  Get attribute
+  dom click <selector>      Click element
+  dom fill <selector> <value> Fill input
+  dom type <selector> <text>  Type text
+  dom clear <selector>      Clear input
+  dom scroll [x] [y]        Scroll by offset
+  dom scrollTo <selector>   Scroll element into view
+  dom exec <js>             Execute JavaScript
+  dom wait <selector>       Wait for element
+  dom exists <selector>     Check if element exists (returns true/false)
+  dom count <selector>      Count matching elements
+  dom visible <selector>    Check if element is visible in viewport
+  dom drag <from> <to>      Drag element to target
+  dom upload <sel> <file>   Upload file to input[type=file]
+  dom frames                List iframes on page
+  dom info                  Get page info
+
+STORAGE COMMANDS:
+  cookies list              List cookies
+  cookies get <name>        Get cookie
+  cookies set <name> <val>  Set cookie
+  cookies delete <name>     Delete cookie
+  cookies clear             Clear all cookies
+  localstorage list         List localStorage
+  localstorage get <key>    Get localStorage item
+  localstorage set <k> <v>  Set localStorage item
+  localstorage delete <key> Delete localStorage item
+  localstorage clear        Clear localStorage
+  sessionstorage ...        Same as localstorage
+
+SCREENSHOT COMMANDS:
+  screenshot                Capture visible area
+  screenshot --full         Capture full page
+  screenshot --element <s>  Capture element
+  screenshot --output <f>   Save to file (default: stdout base64)
+
+NETWORK COMMANDS:
+  network start             Start request logging
+  network stop              Stop request logging
+  network log               Get request log
+  network stats             Get request stats
+  network clear             Clear log
+
+CONSOLE COMMANDS:
+  console                   Get captured console logs (auto-captured)
+  console clear             Clear captured logs
+  console --level <l>       Filter by level (log, warn, error, info, debug)
+
+SHORTCUTS (quick commands):
+  go <url>                  Navigate current tab to URL
+  open <url>                Open URL in new tab
+  wait                      Wait for page to load
+  back                      Go back
+  forward                   Go forward
+  reload                    Reload current tab
+  click <selector>          Click element
+  text <selector>           Get element text
+  html <selector>           Get element HTML
+  fill <sel> <value>        Fill input field
+  type <sel> <text>         Type text into element
+  exec <js>                 Execute JavaScript
+  info                      Get page info
+  exists <selector>         Check if element exists
+  count <selector>          Count matching elements
+  visible <selector>        Check if visible in viewport
+  ls                        List all tabs
+  close <id>                Close tab
+  find <pattern>            Find tabs
+
+OPTIONS:
+  --port <port>             Server port (default: 8765)
+  --browser <id>            Target specific browser
+  --tab <id>                Target specific tab
+  --timeout, -t <ms>        Request timeout in ms (default: 30000)
+  --frame <selector>        Target iframe for DOM commands
+  --json                    Output raw JSON
+  --wait, -w                Wait for page load after navigation
+  --help                    Show this help
+
+EXAMPLES:
+  chromium-cli go github.com
+  chromium-cli open linkedin.com/in/someone --wait
+  chromium-cli click "#login-btn"
+  chromium-cli fill "input[name=email]" "test@example.com"
+  chromium-cli text "h1"
+  chromium-cli ls
+  chromium-cli find "*github*"
+  chromium-cli dom fill "input[name=q]" "search query"
+  chromium-cli screenshot --output page.png
+
+EOF
+}
+
+cmd_server_start() {
+  local server_dir
+  server_dir="$(dirname "$(readlink -f "$0")")/../server"
+
+  if [[ ! -d "$server_dir" ]]; then
+    error "Server directory not found: $server_dir"
+  fi
+
+  cd "$server_dir"
+
+  if [[ ! -d "node_modules" ]]; then
+    echo "Installing dependencies..."
+    npm install
+  fi
+
+  echo "Starting chromium-cli server on port ${CHROMIUM_CLI_PORT:-$DEFAULT_PORT}..."
+  node index.js &
+  echo "Server started (PID: $!)"
+}
+
+cmd_server_stop() {
+  pkill -f "chromium-cli.*index.js" 2>/dev/null && echo "Server stopped" || echo "Server not running"
+}
+
+cmd_server_status() {
+  local response
+  response=$(curl -s "${BASE_URL}/status" 2>/dev/null) || error "Server not running at $BASE_URL"
+
+  echo "Server: running"
+  echo "URL: $BASE_URL"
+  echo ""
+  echo "Connected browsers:"
+  echo "$response" | jq -r '.data.browsers[] | "  - \(.name) (\(.id))"'
+}
+
+cmd_discover() {
+  echo "Scanning ports $PORT_RANGE_START-$PORT_RANGE_END..."
+  local found=0
+  for port in $(seq $PORT_RANGE_START $PORT_RANGE_END); do
+    if response=$(curl -s --connect-timeout 1 "http://${SERVER_HOST}:${port}/status" 2>/dev/null); then
+      echo ""
+      echo "Found server on port $port:"
+      echo "$response" | jq -r '.data.browsers[] | "  - \(.name) (\(.id))"' 2>/dev/null || echo "  (no browsers connected)"
+      found=$((found + 1))
+    fi
+  done
+
+  if [[ $found -eq 0 ]]; then
+    echo "No servers found"
+    exit 1
+  fi
+}
+
+# Tabs
+cmd_tabs_list() {
+  local result
+  result=$(request GET "/tabs/list")
+
+  if [[ "$RAW_JSON" == "1" ]]; then
+    echo "$result"
+  else
+    echo "ID      ACT  TITLE                                              URL"
+    echo "$result" | format_tabs
+  fi
+}
+
+cmd_tabs_get() {
+  local id="$1"
+  [[ -z "$id" ]] && error "Tab ID required"
+  request GET "/tabs/get?id=$id"
+}
+
+cmd_tabs_create() {
+  local url="$1"
+  local data='{}'
+  [[ -n "$url" ]] && data=$(jq -n --arg url "$url" '{url: $url}')
+  request POST "/tabs/create" "$data"
+}
+
+cmd_tabs_close() {
+  local ids="$1"
+  [[ -z "$ids" ]] && error "Tab ID(s) required"
+  request POST "/tabs/close" "{\"id\": \"$ids\"}"
+}
+
+cmd_tabs_reload() {
+  local id="$1"
+  local endpoint="/tabs/reload"
+  [[ -n "$id" ]] && endpoint="${endpoint}?id=$id"
+  request GET "$endpoint"
+}
+
+cmd_tabs_navigate() {
+  local url="$1"
+  local id="$2"
+  [[ -z "$url" ]] && error "URL required"
+  local data
+  data=$(jq -n --arg url "$url" '{url: $url}')
+  [[ -n "$id" ]] && data=$(echo "$data" | jq --arg id "$id" '. + {id: $id}')
+  request POST "/tabs/navigate" "$data"
+}
+
+cmd_tabs_activate() {
+  local id="$1"
+  [[ -z "$id" ]] && error "Tab ID required"
+  request GET "/tabs/activate?id=$id"
+}
+
+cmd_tabs_find() {
+  local pattern="$1"
+  [[ -z "$pattern" ]] && error "Pattern required"
+  local result
+  result=$(request GET "/tabs/find?url=$pattern")
+
+  if [[ "$RAW_JSON" == "1" ]]; then
+    echo "$result"
+  else
+    echo "ID      ACT  TITLE                                              URL"
+    echo "$result" | format_tabs
+  fi
+}
+
+cmd_tabs_back() {
+  local id="$1"
+  local endpoint="/tabs/goBack"
+  [[ -n "$id" ]] && endpoint="${endpoint}?id=$id"
+  request GET "$endpoint"
+}
+
+cmd_tabs_forward() {
+  local id="$1"
+  local endpoint="/tabs/goForward"
+  [[ -n "$id" ]] && endpoint="${endpoint}?id=$id"
+  request GET "$endpoint"
+}
+
+cmd_tabs_pin() {
+  local id="$1"
+  [[ -z "$id" ]] && error "Tab ID required"
+  request POST "/tabs/pin" "{\"id\": \"$id\", \"pinned\": true}"
+}
+
+cmd_tabs_unpin() {
+  local id="$1"
+  [[ -z "$id" ]] && error "Tab ID required"
+  request POST "/tabs/pin" "{\"id\": \"$id\", \"pinned\": false}"
+}
+
+cmd_tabs_mute() {
+  local id="$1"
+  [[ -z "$id" ]] && error "Tab ID required"
+  request POST "/tabs/mute" "{\"id\": \"$id\", \"muted\": true}"
+}
+
+cmd_tabs_unmute() {
+  local id="$1"
+  [[ -z "$id" ]] && error "Tab ID required"
+  request POST "/tabs/mute" "{\"id\": \"$id\", \"muted\": false}"
+}
+
+cmd_tabs_duplicate() {
+  local id="$1"
+  [[ -z "$id" ]] && error "Tab ID required"
+  request GET "/tabs/duplicate?id=$id"
+}
+
+cmd_tabs_move() {
+  local id="$1"
+  local index="$2"
+  [[ -z "$id" ]] && error "Tab ID required"
+  [[ -z "$index" ]] && error "Index required"
+  request POST "/tabs/move" "{\"id\": \"$id\", \"index\": $index}"
+}
+
+cmd_tabs_ungroup() {
+  local ids="$1"
+  [[ -z "$ids" ]] && error "Tab ID(s) required"
+  request POST "/tabs/ungroup" "{\"ids\": \"$ids\"}"
+}
+
+# Groups
+cmd_groups_list() {
+  request GET "/tabs/listGroups"
+}
+
+cmd_groups_create() {
+  local ids="$1"
+  local title="$2"
+  local color="$3"
+  [[ -z "$ids" ]] && error "Tab ID(s) required"
+  local data="{\"ids\": \"$ids\"}"
+  [[ -n "$title" ]] && data=$(echo "$data" | jq --arg t "$title" '. + {title: $t}')
+  [[ -n "$color" ]] && data=$(echo "$data" | jq --arg c "$color" '. + {color: $c}')
+  request POST "/tabs/group" "$data"
+}
+
+cmd_groups_update() {
+  local id="$1"
+  [[ -z "$id" ]] && error "Group ID required"
+  local data="{\"id\": \"$id\"}"
+  [[ -n "$GROUP_TITLE" ]] && data=$(echo "$data" | jq --arg t "$GROUP_TITLE" '. + {title: $t}')
+  [[ -n "$GROUP_COLOR" ]] && data=$(echo "$data" | jq --arg c "$GROUP_COLOR" '. + {color: $c}')
+  request POST "/tabs/updateGroup" "$data"
+}
+
+# Windows
+cmd_windows_list() {
+  local result
+  result=$(request GET "/windows/list")
+
+  if [[ "$RAW_JSON" == "1" ]]; then
+    echo "$result"
+  else
+    echo "ID      STATE       TABS"
+    echo "$result" | format_windows
+  fi
+}
+
+cmd_windows_get() {
+  local id="$1"
+  [[ -z "$id" ]] && error "Window ID required"
+  request GET "/windows/get?id=$id&populate=true"
+}
+
+cmd_windows_create() {
+  local url="$1"
+  local data='{}'
+  [[ -n "$url" ]] && data=$(jq -n --arg url "$url" '{url: $url}')
+  request POST "/windows/create" "$data"
+}
+
+cmd_windows_close() {
+  local id="$1"
+  [[ -z "$id" ]] && error "Window ID required"
+  request GET "/windows/close?id=$id"
+}
+
+cmd_windows_focus() {
+  local id="$1"
+  [[ -z "$id" ]] && error "Window ID required"
+  request GET "/windows/focus?id=$id"
+}
+
+cmd_windows_minimize() {
+  local id="$1"
+  [[ -z "$id" ]] && error "Window ID required"
+  request GET "/windows/minimize?id=$id"
+}
+
+cmd_windows_maximize() {
+  local id="$1"
+  [[ -z "$id" ]] && error "Window ID required"
+  request GET "/windows/maximize?id=$id"
+}
+
+cmd_windows_fullscreen() {
+  local id="$1"
+  [[ -z "$id" ]] && error "Window ID required"
+  request GET "/windows/fullscreen?id=$id"
+}
+
+# DOM
+cmd_dom_query() {
+  local selector="$1"
+  [[ -z "$selector" ]] && error "Selector required"
+  request POST "/dom/query" "{\"selector\": $(echo "$selector" | jq -R .)}"
+}
+
+cmd_dom_text() {
+  local selector="$1"
+  [[ -z "$selector" ]] && error "Selector required"
+  local data
+  data=$(jq -n --arg s "$selector" '{selector: $s}')
+  [[ -n "$FRAME_SELECTOR" ]] && data=$(echo "$data" | jq --arg f "$FRAME_SELECTOR" '. + {frame: $f}')
+  local result
+  result=$(request POST "/dom/getText" "$data")
+  echo "$result"
+}
+
+cmd_dom_html() {
+  local selector="$1"
+  [[ -z "$selector" ]] && error "Selector required"
+  local result
+  result=$(request POST "/dom/getHtml" "{\"selector\": $(echo "$selector" | jq -R .)}")
+
+  echo "$result"
+}
+
+cmd_dom_attr() {
+  local selector="$1"
+  local attr="$2"
+  [[ -z "$selector" ]] && error "Selector required"
+  [[ -z "$attr" ]] && error "Attribute name required"
+  request POST "/dom/getAttribute" "{\"selector\": $(echo "$selector" | jq -R .), \"attr\": \"$attr\"}"
+}
+
+cmd_dom_click() {
+  local selector="$1"
+  [[ -z "$selector" ]] && error "Selector required"
+  local data
+  data=$(jq -n --arg s "$selector" '{selector: $s}')
+  [[ -n "$FRAME_SELECTOR" ]] && data=$(echo "$data" | jq --arg f "$FRAME_SELECTOR" '. + {frame: $f}')
+  local result
+  result=$(request POST "/dom/click" "$data")
+
+  if [[ "$RAW_JSON" == "1" ]]; then
+    echo "$result"
+  else
+    echo "Clicked: $selector"
+  fi
+}
+
+cmd_dom_fill() {
+  local selector="$1"
+  local value="$2"
+  [[ -z "$selector" ]] && error "Selector required"
+  [[ -z "$value" ]] && error "Value required"
+  local data
+  data=$(jq -n --arg s "$selector" --arg v "$value" '{selector: $s, value: $v}')
+  [[ -n "$FRAME_SELECTOR" ]] && data=$(echo "$data" | jq --arg f "$FRAME_SELECTOR" '. + {frame: $f}')
+  local result
+  result=$(request POST "/dom/fill" "$data")
+
+  if [[ "$RAW_JSON" == "1" ]]; then
+    echo "$result"
+  else
+    echo "Filled: $selector"
+  fi
+}
+
+cmd_dom_type() {
+  local selector="$1"
+  local text="$2"
+  [[ -z "$selector" ]] && error "Selector required"
+  [[ -z "$text" ]] && error "Text required"
+  local result
+  result=$(request POST "/dom/type" "{\"selector\": $(echo "$selector" | jq -R .), \"text\": $(echo "$text" | jq -R .)}")
+
+  if [[ "$RAW_JSON" == "1" ]]; then
+    echo "$result"
+  else
+    echo "Typed: $selector"
+  fi
+}
+
+cmd_dom_clear() {
+  local selector="$1"
+  [[ -z "$selector" ]] && error "Selector required"
+  request POST "/dom/clear" "{\"selector\": $(echo "$selector" | jq -R .)}"
+}
+
+cmd_dom_scroll() {
+  local x="${1:-0}"
+  local y="${2:-0}"
+  request POST "/dom/scroll" "{\"x\": $x, \"y\": $y}"
+}
+
+cmd_dom_scrollTo() {
+  local selector="$1"
+  [[ -z "$selector" ]] && error "Selector required"
+  request POST "/dom/scroll" "{\"selector\": $(echo "$selector" | jq -R .)}"
+}
+
+cmd_dom_exec() {
+  local code="$1"
+  [[ -z "$code" ]] && error "JavaScript code required"
+  request POST "/dom/execute" "{\"code\": $(echo "$code" | jq -R .)}"
+}
+
+cmd_dom_wait() {
+  local selector="$1"
+  local timeout="${2:-10000}"
+  [[ -z "$selector" ]] && error "Selector required"
+  request POST "/dom/waitFor" "{\"selector\": $(echo "$selector" | jq -R .), \"timeout\": $timeout}"
+}
+
+cmd_dom_exists() {
+  local selector="$1"
+  [[ -z "$selector" ]] && error "Selector required"
+  local result
+  result=$(request POST "/dom/exists" "{\"selector\": $(echo "$selector" | jq -R .)}")
+
+  if [[ "$result" == "true" ]]; then
+    echo "true"
+    return 0
+  else
+    echo "false"
+    return 1
+  fi
+}
+
+cmd_dom_count() {
+  local selector="$1"
+  [[ -z "$selector" ]] && error "Selector required"
+  request POST "/dom/count" "{\"selector\": $(echo "$selector" | jq -R .)}"
+}
+
+cmd_dom_visible() {
+  local selector="$1"
+  [[ -z "$selector" ]] && error "Selector required"
+  local result
+  result=$(request POST "/dom/visible" "{\"selector\": $(echo "$selector" | jq -R .)}")
+
+  if [[ "$result" == "true" ]]; then
+    echo "true"
+    return 0
+  else
+    echo "false"
+    return 1
+  fi
+}
+
+cmd_dom_drag() {
+  local from="$1"
+  local to="$2"
+  [[ -z "$from" ]] && error "Source selector required"
+  [[ -z "$to" ]] && error "Target selector required"
+  local data
+  data=$(jq -n --arg from "$from" --arg to "$to" '{from: $from, to: $to}')
+  [[ -n "$FRAME_SELECTOR" ]] && data=$(echo "$data" | jq --arg f "$FRAME_SELECTOR" '. + {frame: $f}')
+  request POST "/dom/drag" "$data"
+}
+
+cmd_dom_upload() {
+  local selector="$1"
+  local filepath="$2"
+  [[ -z "$selector" ]] && error "Selector required"
+  [[ -z "$filepath" ]] && error "File path required"
+  [[ ! -f "$filepath" ]] && error "File not found: $filepath"
+
+  local filename
+  filename=$(basename "$filepath")
+  local mimetype
+  mimetype=$(file --mime-type -b "$filepath" 2>/dev/null || echo "application/octet-stream")
+  local filedata
+  filedata=$(base64 -w0 "$filepath")
+
+  local data
+  data=$(jq -n \
+    --arg sel "$selector" \
+    --arg data "$filedata" \
+    --arg name "$filename" \
+    --arg mime "$mimetype" \
+    '{selector: $sel, fileData: $data, fileName: $name, mimeType: $mime}')
+  [[ -n "$FRAME_SELECTOR" ]] && data=$(echo "$data" | jq --arg f "$FRAME_SELECTOR" '. + {frame: $f}')
+  request POST "/dom/upload" "$data"
+}
+
+cmd_dom_frames() {
+  local result
+  result=$(request GET "/dom/listFrames")
+
+  if [[ "$RAW_JSON" == "1" ]]; then
+    echo "$result"
+  else
+    echo "INDEX  ACCESSIBLE  SELECTOR                         SRC"
+    echo "$result" | jq -r '.[] | "\(.index)\t\(if .accessible then "yes" else "no " end)\t\(.selector[:30])\t\(.src // "-" | .[:40])"'
+  fi
+}
+
+cmd_dom_info() {
+  local result
+  result=$(request GET "/dom/getPageInfo")
+
+  if [[ "$RAW_JSON" == "1" ]]; then
+    echo "$result"
+  else
+    echo "$result" | jq -r '"Title: \(.title)\nURL: \(.url)\nDomain: \(.domain)"'
+  fi
+}
+
+# Storage - Cookies
+cmd_cookies_list() {
+  request GET "/storage/getCookies"
+}
+
+cmd_cookies_get() {
+  local name="$1"
+  [[ -z "$name" ]] && error "Cookie name required"
+  request GET "/storage/getCookie?name=$name"
+}
+
+cmd_cookies_set() {
+  local name="$1"
+  local value="$2"
+  [[ -z "$name" ]] && error "Cookie name required"
+  [[ -z "$value" ]] && error "Cookie value required"
+  request POST "/storage/setCookie" "{\"name\": \"$name\", \"value\": $(echo "$value" | jq -R .)}"
+}
+
+cmd_cookies_delete() {
+  local name="$1"
+  [[ -z "$name" ]] && error "Cookie name required"
+  request GET "/storage/deleteCookie?name=$name"
+}
+
+cmd_cookies_clear() {
+  request GET "/storage/clearCookies"
+}
+
+# Storage - localStorage
+cmd_localstorage_list() {
+  request GET "/storage/getLocalStorage"
+}
+
+cmd_localstorage_get() {
+  local key="$1"
+  [[ -z "$key" ]] && error "Key required"
+  request GET "/storage/getLocalStorage?key=$key"
+}
+
+cmd_localstorage_set() {
+  local key="$1"
+  local value="$2"
+  [[ -z "$key" ]] && error "Key required"
+  [[ -z "$value" ]] && error "Value required"
+  request POST "/storage/setLocalStorage" "{\"key\": \"$key\", \"value\": $(echo "$value" | jq -R .)}"
+}
+
+cmd_localstorage_delete() {
+  local key="$1"
+  [[ -z "$key" ]] && error "Key required"
+  request GET "/storage/deleteLocalStorage?key=$key"
+}
+
+cmd_localstorage_clear() {
+  request GET "/storage/clearLocalStorage"
+}
+
+# Storage - sessionStorage
+cmd_sessionstorage_list() {
+  request GET "/storage/getSessionStorage"
+}
+
+cmd_sessionstorage_get() {
+  local key="$1"
+  [[ -z "$key" ]] && error "Key required"
+  request GET "/storage/getSessionStorage?key=$key"
+}
+
+cmd_sessionstorage_set() {
+  local key="$1"
+  local value="$2"
+  [[ -z "$key" ]] && error "Key required"
+  [[ -z "$value" ]] && error "Value required"
+  request POST "/storage/setSessionStorage" "{\"key\": \"$key\", \"value\": $(echo "$value" | jq -R .)}"
+}
+
+cmd_sessionstorage_delete() {
+  local key="$1"
+  [[ -z "$key" ]] && error "Key required"
+  request GET "/storage/deleteSessionStorage?key=$key"
+}
+
+cmd_sessionstorage_clear() {
+  request GET "/storage/clearSessionStorage"
+}
+
+# Screenshot
+cmd_screenshot() {
+  local endpoint="/screenshot/capture"
+  local data='{}'
+
+  if [[ -n "$SCREENSHOT_FULL" ]]; then
+    data='{"fullPage": true}'
+  elif [[ -n "$SCREENSHOT_ELEMENT" ]]; then
+    data="{\"selector\": $(echo "$SCREENSHOT_ELEMENT" | jq -R .)}"
+  fi
+
+  local result
+  result=$(request POST "$endpoint" "$data")
+
+  # Always save to file to avoid base64 flooding terminal/context
+  local output_file="${SCREENSHOT_OUTPUT:-/tmp/screenshot-$(date +%s).png}"
+
+  local data_url
+  data_url=$(echo "$result" | jq -r '.dataUrl // .parts[0].dataUrl // empty')
+
+  if [[ -n "$data_url" ]]; then
+    echo "$data_url" | sed 's/^data:image\/[^;]*;base64,//' | base64 -d > "$output_file"
+    echo "$output_file"
+  else
+    # For full page with multiple parts, save first part
+    local first_part
+    first_part=$(echo "$result" | jq -r '.parts[0].dataUrl // empty')
+    if [[ -n "$first_part" ]]; then
+      echo "$first_part" | sed 's/^data:image\/[^;]*;base64,//' | base64 -d > "$output_file"
+      echo "$output_file"
+    else
+      echo "Error: No image data" >&2
+      exit 1
+    fi
+  fi
+}
+
+# Network
+cmd_network_start() {
+  request GET "/network/startLogging"
+}
+
+cmd_network_stop() {
+  request GET "/network/stopLogging"
+}
+
+cmd_network_log() {
+  request GET "/network/getLog"
+}
+
+cmd_network_stats() {
+  request GET "/network/getStats"
+}
+
+cmd_network_clear() {
+  request GET "/network/clearLog"
+}
+
+# Console
+cmd_console_list() {
+  local endpoint="/console/getLogs"
+  local params=""
+
+  [[ -n "$CONSOLE_LEVEL" ]] && params="level=$CONSOLE_LEVEL"
+  [[ -n "$params" ]] && endpoint="${endpoint}?${params}"
+
+  local result
+  result=$(request GET "$endpoint")
+
+  if [[ "$RAW_JSON" == "1" ]]; then
+    echo "$result"
+  else
+    # Format logs nicely
+    if [[ "$result" == "[]" || "$result" == "null" ]]; then
+      echo "No logs captured"
+    else
+      echo "$result" | jq -r '.[] | "\((.timestamp / 1000 | strftime("%H:%M:%S"))) [\(.level | ascii_upcase)] \(.message)"'
+    fi
+  fi
+}
+
+cmd_console_clear() {
+  local result
+  result=$(request GET "/console/clear")
+
+  if [[ "$RAW_JSON" == "1" ]]; then
+    echo "$result"
+  else
+    local count
+    count=$(echo "$result" | jq -r '.count // 0')
+    echo "Cleared $count log entries"
+  fi
+}
+
+# ============================================================================
+# Shortcuts - simplified commands
+# ============================================================================
+
+# Wait for page to load
+cmd_wait() {
+  local timeout="${1:-30000}"
+  local result
+  result=$(request GET "/tabs/waitForLoad?timeout=$timeout")
+
+  if [[ "$RAW_JSON" == "1" ]]; then
+    echo "$result"
+  else
+    echo "$result" | jq -r '"Loaded: \(.title) (\(.url))"'
+  fi
+}
+
+# Go to URL (navigate current tab + wait)
+cmd_go() {
+  local input_url=""
+  local do_wait="$WAIT_FOR_LOAD"
+
+  # Parse args (allow --wait after url)
+  for arg in "$@"; do
+    case "$arg" in
+      --wait|-w) do_wait=1 ;;
+      *) [[ -z "$input_url" ]] && input_url="$arg" ;;
+    esac
+  done
+
+  [[ -z "$input_url" ]] && error "URL required. Usage: chromium-cli go <url> [--wait]"
+
+  # Validate and normalize URL
+  local url
+  url=$(normalize_url "$input_url") || error "Invalid URL: $input_url"
+
+  request POST "/tabs/navigate" "{\"url\": $(echo "$url" | jq -R .)}" >/dev/null
+
+  if [[ "$do_wait" == "1" ]]; then
+    cmd_wait
+  else
+    echo "Navigating to $url"
+  fi
+}
+
+# Open new tab with URL (+ wait)
+cmd_open() {
+  local input_url=""
+  local do_wait="$WAIT_FOR_LOAD"
+
+  # Parse args (allow --wait after url)
+  for arg in "$@"; do
+    case "$arg" in
+      --wait|-w) do_wait=1 ;;
+      *) [[ -z "$input_url" ]] && input_url="$arg" ;;
+    esac
+  done
+
+  [[ -z "$input_url" ]] && error "URL required. Usage: chromium-cli open <url> [--wait]"
+
+  # Validate and normalize URL
+  local url
+  url=$(normalize_url "$input_url") || error "Invalid URL: $input_url"
+
+  local result
+  result=$(request POST "/tabs/create" "{\"url\": $(echo "$url" | jq -R .)}")
+  local tab_id
+  tab_id=$(echo "$result" | jq -r '.id')
+
+  if [[ "$do_wait" == "1" ]]; then
+    request GET "/tabs/waitForLoad?id=$tab_id" >/dev/null
+    echo "Opened: $url (tab $tab_id)"
+  else
+    echo "Opening: $url (tab $tab_id)"
+  fi
+}
+
+# ============================================================================
+# Output formatting helpers
+# ============================================================================
+
+# Simple text output for common operations
+output_simple() {
+  local key="$1"
+  local result="$2"
+
+  if [[ "$RAW_JSON" == "1" ]]; then
+    echo "$result"
+  else
+    # Try to extract a meaningful value
+    local value
+    value=$(echo "$result" | jq -r ".$key // .text // .value // . | if type == \"string\" then . else tostring end" 2>/dev/null)
+    echo "$value"
+  fi
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+# Parse all arguments - separate options from positional args
+POSITIONAL_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --port)
+      BASE_URL="http://${SERVER_HOST}:$2"
+      shift 2
+      ;;
+    --browser)
+      BROWSER_ID="$2"
+      shift 2
+      ;;
+    --tab)
+      TAB_ID="$2"
+      shift 2
+      ;;
+    --json)
+      RAW_JSON=1
+      shift
+      ;;
+    --title)
+      GROUP_TITLE="$2"
+      shift 2
+      ;;
+    --color)
+      GROUP_COLOR="$2"
+      shift 2
+      ;;
+    --full)
+      SCREENSHOT_FULL=1
+      shift
+      ;;
+    --element)
+      SCREENSHOT_ELEMENT="$2"
+      shift 2
+      ;;
+    --output|-o)
+      SCREENSHOT_OUTPUT="$2"
+      shift 2
+      ;;
+    --wait|-w)
+      WAIT_FOR_LOAD=1
+      shift
+      ;;
+    --timeout|-t)
+      REQUEST_TIMEOUT="$2"
+      shift 2
+      ;;
+    --frame)
+      FRAME_SELECTOR="$2"
+      shift 2
+      ;;
+    --level)
+      CONSOLE_LEVEL="$2"
+      shift 2
+      ;;
+    --help|-h)
+      cmd_help
+      exit 0
+      ;;
+    -*)
+      # Unknown option - could be for subcommand, pass through
+      POSITIONAL_ARGS+=("$1")
+      shift
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+# Restore positional args
+set -- "${POSITIONAL_ARGS[@]}"
+
+# Get command
+CMD="${1:-help}"
+SUBCMD="${2:-}"
+shift || true
+shift 2>/dev/null || true
+
+# Route commands
+case "$CMD" in
+  help|--help|-h)
+    cmd_help
+    ;;
+  server)
+    case "$SUBCMD" in
+      start) cmd_server_start ;;
+      stop) cmd_server_stop ;;
+      status) cmd_server_status ;;
+      *) error "Unknown server command: $SUBCMD" ;;
+    esac
+    ;;
+  discover)
+    cmd_discover
+    ;;
+  tabs)
+    case "$SUBCMD" in
+      list|ls) cmd_tabs_list ;;
+      get) cmd_tabs_get "$@" ;;
+      create|new) cmd_tabs_create "$@" ;;
+      close|rm) cmd_tabs_close "$@" ;;
+      reload) cmd_tabs_reload "$@" ;;
+      navigate|goto|go) cmd_tabs_navigate "$@" ;;
+      activate|focus) cmd_tabs_activate "$@" ;;
+      find|search) cmd_tabs_find "$@" ;;
+      back) cmd_tabs_back "$@" ;;
+      forward) cmd_tabs_forward "$@" ;;
+      pin) cmd_tabs_pin "$@" ;;
+      unpin) cmd_tabs_unpin "$@" ;;
+      mute) cmd_tabs_mute "$@" ;;
+      unmute) cmd_tabs_unmute "$@" ;;
+      duplicate|dup) cmd_tabs_duplicate "$@" ;;
+      move) cmd_tabs_move "$@" ;;
+      ungroup) cmd_tabs_ungroup "$@" ;;
+      *) error "Unknown tabs command: $SUBCMD. Run 'chromium-cli help' for usage." ;;
+    esac
+    ;;
+  groups)
+    case "$SUBCMD" in
+      list|ls) cmd_groups_list ;;
+      create|new) cmd_groups_create "$@" ;;
+      update) cmd_groups_update "$@" ;;
+      *) error "Unknown groups command: $SUBCMD" ;;
+    esac
+    ;;
+  windows)
+    case "$SUBCMD" in
+      list|ls) cmd_windows_list ;;
+      get) cmd_windows_get "$@" ;;
+      create|new) cmd_windows_create "$@" ;;
+      close|rm) cmd_windows_close "$@" ;;
+      focus) cmd_windows_focus "$@" ;;
+      minimize|min) cmd_windows_minimize "$@" ;;
+      maximize|max) cmd_windows_maximize "$@" ;;
+      fullscreen|fs) cmd_windows_fullscreen "$@" ;;
+      *) error "Unknown windows command: $SUBCMD" ;;
+    esac
+    ;;
+  dom)
+    case "$SUBCMD" in
+      query|q) cmd_dom_query "$@" ;;
+      text) cmd_dom_text "$@" ;;
+      html) cmd_dom_html "$@" ;;
+      attr) cmd_dom_attr "$@" ;;
+      click) cmd_dom_click "$@" ;;
+      fill) cmd_dom_fill "$@" ;;
+      type) cmd_dom_type "$@" ;;
+      clear) cmd_dom_clear "$@" ;;
+      scroll) cmd_dom_scroll "$@" ;;
+      scrollTo|scrollto) cmd_dom_scrollTo "$@" ;;
+      exec|execute|js) cmd_dom_exec "$@" ;;
+      wait) cmd_dom_wait "$@" ;;
+      exists) cmd_dom_exists "$@" ;;
+      count) cmd_dom_count "$@" ;;
+      visible) cmd_dom_visible "$@" ;;
+      drag) cmd_dom_drag "$@" ;;
+      upload) cmd_dom_upload "$@" ;;
+      frames) cmd_dom_frames ;;
+      info) cmd_dom_info ;;
+      *) error "Unknown dom command: $SUBCMD" ;;
+    esac
+    ;;
+  cookies)
+    case "$SUBCMD" in
+      list|ls) cmd_cookies_list ;;
+      get) cmd_cookies_get "$@" ;;
+      set) cmd_cookies_set "$@" ;;
+      delete|rm) cmd_cookies_delete "$@" ;;
+      clear) cmd_cookies_clear ;;
+      *) error "Unknown cookies command: $SUBCMD" ;;
+    esac
+    ;;
+  localstorage|localStorage)
+    case "$SUBCMD" in
+      list) cmd_localstorage_list ;;
+      get) cmd_localstorage_get "$@" ;;
+      set) cmd_localstorage_set "$@" ;;
+      delete|rm) cmd_localstorage_delete "$@" ;;
+      clear) cmd_localstorage_clear ;;
+      *) error "Unknown localstorage command: $SUBCMD" ;;
+    esac
+    ;;
+  sessionstorage|sessionStorage|ss)
+    case "$SUBCMD" in
+      list) cmd_sessionstorage_list ;;
+      get) cmd_sessionstorage_get "$@" ;;
+      set) cmd_sessionstorage_set "$@" ;;
+      delete|rm) cmd_sessionstorage_delete "$@" ;;
+      clear) cmd_sessionstorage_clear ;;
+      *) error "Unknown sessionstorage command: $SUBCMD" ;;
+    esac
+    ;;
+  screenshot|ss)
+    cmd_screenshot "$@"
+    ;;
+  network|net)
+    case "$SUBCMD" in
+      start) cmd_network_start ;;
+      stop) cmd_network_stop ;;
+      log|logs) cmd_network_log ;;
+      stats) cmd_network_stats ;;
+      clear) cmd_network_clear ;;
+      *) error "Unknown network command: $SUBCMD" ;;
+    esac
+    ;;
+  console)
+    case "$SUBCMD" in
+      clear) cmd_console_clear ;;
+      list|ls|"") cmd_console_list ;;
+      *) error "Unknown console command: $SUBCMD" ;;
+    esac
+    ;;
+  status)
+    cmd_server_status
+    ;;
+
+  # ========== SHORTCUTS ==========
+  # Navigation shortcuts
+  go)
+    cmd_go "$SUBCMD" "$@"
+    ;;
+  open)
+    cmd_open "$SUBCMD" "$@"
+    ;;
+  wait)
+    cmd_wait "$@"
+    ;;
+  back)
+    cmd_tabs_back "$@"
+    ;;
+  forward)
+    cmd_tabs_forward "$@"
+    ;;
+  reload)
+    cmd_tabs_reload "$@"
+    ;;
+
+  # DOM shortcuts
+  click)
+    cmd_dom_click "$SUBCMD" "$@"
+    ;;
+  text)
+    cmd_dom_text "$SUBCMD" "$@"
+    ;;
+  html)
+    cmd_dom_html "$SUBCMD" "$@"
+    ;;
+  fill)
+    cmd_dom_fill "$SUBCMD" "$@"
+    ;;
+  type)
+    cmd_dom_type "$SUBCMD" "$@"
+    ;;
+  exec|js)
+    cmd_dom_exec "$SUBCMD" "$@"
+    ;;
+  info)
+    cmd_dom_info
+    ;;
+  exists)
+    cmd_dom_exists "$SUBCMD" "$@"
+    ;;
+  count)
+    cmd_dom_count "$SUBCMD" "$@"
+    ;;
+  visible)
+    cmd_dom_visible "$SUBCMD" "$@"
+    ;;
+
+  # Tab shortcuts
+  ls)
+    cmd_tabs_list
+    ;;
+  close)
+    cmd_tabs_close "$SUBCMD" "$@"
+    ;;
+  find)
+    cmd_tabs_find "$SUBCMD" "$@"
+    ;;
+
+  *)
+    error "Unknown command: $CMD. Run 'chromium-cli help' for usage."
+    ;;
+esac

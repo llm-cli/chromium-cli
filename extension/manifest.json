@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "Chromium CLI",
+  "version": "1.0.0",
+  "description": "Control your browser via CLI - connects to chromium-cli server",
+  "permissions": [
+    "tabs",
+    "activeTab",
+    "scripting",
+    "cookies",
+    "storage",
+    "webRequest",
+    "tabGroups",
+    "debugger",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "js/background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["js/content/console-capture.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
